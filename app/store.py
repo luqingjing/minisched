@@ -124,6 +124,85 @@ class TaskStore:
         with self._lock:
             return [self._row_to_dict(r) for r in self._conn.execute(sql, args)]
 
+    def cancel(self, task_id: str) -> dict:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+                (CANCELED, self.now(), task_id, PENDING))
+            if cur.rowcount == 0:
+                row = self._get(task_id)  # raises NotFound if missing
+                raise Conflict(f"cannot cancel a task in status {row['status']}")
+            return self._row_to_dict(self._get(task_id))
+
+    # worker side
+    def lease(self, queue: str, worker_id: str, *, max_tasks: int = 1,
+              lease_seconds: float = 30.0) -> list[dict]:
+        """
+        Atomically claim up to max_tasks runnable tasks. Each claim gets a fresh
+        lease_token; later heartbeat/ack/nack must present it (fencing), so a
+        worker whose lease expired and was handed to someone else is rejected.
+        """
+        now = self.now()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._conn.execute(
+                    """SELECT id FROM tasks
+                       WHERE queue = ? AND status = ? AND next_run_at <= ?
+                       ORDER BY next_run_at, created_at LIMIT ?""",
+                    (queue, PENDING, now, max(1, min(max_tasks, 100)))).fetchall()
+                claimed = []
+                for r in rows:
+                    token = uuid.uuid4().hex
+                    cur = self._conn.execute(
+                        """UPDATE tasks SET status = ?, attempts = attempts + 1,
+                               lease_owner = ?, lease_token = ?, lease_expires_at = ?, updated_at = ?
+                           WHERE id = ? AND status = ?""",
+                        (LEASED, worker_id, token, now + lease_seconds, now, r["id"], PENDING))
+                    if cur.rowcount == 1:
+                        claimed.append(r["id"])
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+            return [self._row_to_dict(self._get(i)) for i in claimed]
+
+    def _fenced_update(self, task_id: str, lease_token: str, set_sql: str, args: tuple) -> dict:
+        cur = self._conn.execute(
+            f"UPDATE tasks SET {set_sql} WHERE id = ? AND status = ? AND lease_token = ?",
+            (*args, task_id, LEASED, lease_token))
+        if cur.rowcount == 0:
+            row = self._get(task_id)
+            raise Conflict(f"lease token rejected (task is {row['status']}, "
+                           f"owned by {row['lease_owner']})")
+        return self._row_to_dict(self._get(task_id))
+
+    def heartbeat(self, task_id: str, lease_token: str, *, lease_seconds: float = 30.0) -> dict:
+        now = self.now()
+        with self._lock:
+            return self._fenced_update(
+                task_id, lease_token,
+                "lease_expires_at = ?, updated_at = ?", (now + lease_seconds, now))
+
+    def ack(self, task_id: str, lease_token: str, result: Any = None) -> dict:
+        now = self.now()
+        with self._lock:
+            return self._fenced_update(
+                task_id, lease_token,
+                "status = ?, result = ?, lease_owner = NULL, lease_token = NULL, "
+                "lease_expires_at = NULL, updated_at = ?",
+                (SUCCEEDED, json.dumps(result), now))
+
+    # background
+    def stats(self) -> dict:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT queue, status, COUNT(*) AS n FROM tasks GROUP BY queue, status").fetchall()
+        out: dict[str, dict[str, int]] = {}
+        for r in rows:
+            out.setdefault(r["queue"], {s: 0 for s in STATUSES})[r["status"]] = r["n"]
+        return out
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
