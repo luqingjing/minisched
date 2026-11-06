@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.store import CANCELED, LEASED, PENDING, SUCCEEDED, Conflict
+from app.store import CANCELED, DEAD, LEASED, PENDING, SUCCEEDED, Conflict
 
 
 # ---------------------------------------------------------------- idempotency
@@ -59,6 +59,72 @@ def test_ack_with_token_succeeds(store):
     assert done["status"] == SUCCEEDED
     assert done["result"] == {"ok": 1}
     assert done["lease_token"] is None
+
+
+def test_stale_token_is_fenced_out(store, clock):
+    t, _ = store.submit("q", {}, max_attempts=5)
+    old = store.lease("q", "w1", lease_seconds=5)[0]
+    clock.advance(6)
+    assert store.reclaim_expired() == 1  # w1 presumed dead
+    clock.advance(1)                      # past the 1s backoff
+    new = store.lease("q", "w2")[0]       # handed to w2
+    with pytest.raises(Conflict):
+        store.ack(t["id"], old["lease_token"])  # w1 comes back late
+    with pytest.raises(Conflict):
+        store.heartbeat(t["id"], old["lease_token"])
+    assert store.ack(t["id"], new["lease_token"])["status"] == SUCCEEDED
+
+
+def test_heartbeat_extends_lease(store, clock):
+    t, _ = store.submit("q", {})
+    leased = store.lease("q", "w", lease_seconds=5)[0]
+    clock.advance(4)
+    store.heartbeat(t["id"], leased["lease_token"], lease_seconds=5)
+    clock.advance(4)  # 8s total, would have expired without the heartbeat
+    assert store.reclaim_expired() == 0
+    assert store.get(t["id"])["status"] == LEASED
+
+
+# ---------------------------------------------------------------- retry / backoff
+def test_nack_retries_with_exponential_backoff_then_dies(store, clock):
+    t, _ = store.submit("q", {}, max_attempts=3)
+    l1 = store.lease("q", "w")[0]
+    r = store.nack(t["id"], l1["lease_token"], "boom")
+    assert (r["status"], r["attempts"]) == (PENDING, 1)
+    assert r["next_run_at"] - clock() == pytest.approx(1.0)
+    assert store.lease("q", "w") == []  # not yet due
+    clock.advance(1)
+    l2 = store.lease("q", "w")[0]
+    r = store.nack(t["id"], l2["lease_token"], "boom")
+    assert r["next_run_at"] - clock() == pytest.approx(2.0)
+    clock.advance(2)
+    l3 = store.lease("q", "w")[0]
+    r = store.nack(t["id"], l3["lease_token"], "boom")
+    assert (r["status"], r["attempts"]) == (DEAD, 3)
+    assert r["last_error"] == "boom"
+    assert store.lease("q", "w") == []
+
+
+def test_nack_can_override_retry_delay(store, clock):
+    t, _ = store.submit("q", {})
+    leased = store.lease("q", "w")[0]
+    r = store.nack(t["id"], leased["lease_token"], "rate limited", retry_after_seconds=30)
+    assert r["next_run_at"] - clock() == pytest.approx(30.0)
+
+
+def test_expired_lease_counts_as_an_attempt(store, clock):
+    t, _ = store.submit("q", {}, max_attempts=2)
+    store.lease("q", "w", lease_seconds=1)
+    clock.advance(2)
+    store.reclaim_expired()
+    assert store.get(t["id"])["status"] == PENDING
+    clock.advance(5)  # past backoff
+    store.lease("q", "w", lease_seconds=1)
+    clock.advance(2)
+    store.reclaim_expired()
+    got = store.get(t["id"])
+    assert (got["status"], got["attempts"]) == (DEAD, 2)
+    assert "lease expired" in got["last_error"]
 
 
 # ---------------------------------------------------------------- cancel / observability / stats

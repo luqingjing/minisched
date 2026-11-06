@@ -5,7 +5,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from app.store import TaskStore  # noqa: E402
+from app.store import BackoffPolicy, TaskStore  # noqa: E402
 
 
 class FakeClock:
@@ -26,7 +26,7 @@ def clock():
 
 @pytest.fixture
 def store(clock):
-    """In-memory store driven by the fake clock."""
-    s = TaskStore(":memory:", clock=clock)
+    """In-memory store with deterministic backoff (1s, 2s, 4s ...) driven by the fake clock."""
+    s = TaskStore(":memory:", BackoffPolicy(1.0, 60.0, 0.0), clock=clock)
     yield s
     s.close()

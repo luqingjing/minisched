@@ -7,10 +7,12 @@ consumers must be idempotent.
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Optional
 
 PENDING, LEASED, SUCCEEDED, DEAD, CANCELED = "PENDING", "LEASED", "SUCCEEDED", "DEAD", "CANCELED"
@@ -49,6 +51,17 @@ class NotFound(Exception):  # -> 404
     pass
 
 
+@dataclass
+class BackoffPolicy:
+    base_seconds: float = 1.0
+    max_seconds: float = 300.0
+    jitter: float = 0.2  # +/- 20%
+
+    def delay(self, attempts: int) -> float:
+        raw = min(self.max_seconds, self.base_seconds * (2 ** max(0, attempts - 1)))
+        return raw * (1 + random.uniform(-self.jitter, self.jitter))
+
+
 class TaskStore:
     """
     SQLite-backed store. One connection guarded by a lock: SQLite is a
@@ -56,13 +69,15 @@ class TaskStore:
     transactions from interleaving across server threads.
     """
 
-    def __init__(self, path: str = "minisched.db", clock=time.time):
+    def __init__(self, path: str = "minisched.db", backoff: BackoffPolicy | None = None,
+                 clock=time.time):
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
         self._lock = threading.RLock()
+        self.backoff = backoff or BackoffPolicy()
         self.now = clock
 
     # helpers
@@ -193,7 +208,43 @@ class TaskStore:
                 "lease_expires_at = NULL, updated_at = ?",
                 (SUCCEEDED, json.dumps(result), now))
 
+    def nack(self, task_id: str, lease_token: str, error: str = "",
+             retry_after_seconds: Optional[float] = None) -> dict:
+        """Worker gave up on this attempt. Retry with backoff, or bury as DEAD."""
+        now = self.now()
+        with self._lock:
+            row = self._get(task_id)
+            if row["status"] != LEASED or row["lease_token"] != lease_token:
+                raise Conflict("lease token rejected")
+            return self._release(row, error or "nack", now, retry_after_seconds)
+
+    def _release(self, row: sqlite3.Row, error: str, now: float,
+                 retry_after: Optional[float] = None) -> dict:
+        exhausted = row["attempts"] >= row["max_attempts"]
+        status = DEAD if exhausted else PENDING
+        delay = retry_after if retry_after is not None else self.backoff.delay(row["attempts"])
+        self._conn.execute(
+            """UPDATE tasks SET status = ?, last_error = ?, next_run_at = ?,
+                   lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+               WHERE id = ?""",
+            (status, error[:2000], now + (0 if exhausted else delay), now, row["id"]))
+        return self._row_to_dict(self._get(row["id"]))
+
     # background
+    def reclaim_expired(self) -> int:
+        """
+        Return tasks whose lease expired to PENDING (or DEAD). This is how the
+        system survives a worker that crashed mid-task: nobody has to notice.
+        """
+        now = self.now()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tasks WHERE status = ? AND lease_expires_at < ?",
+                (LEASED, now)).fetchall()
+            for row in rows:
+                self._release(row, f"lease expired (owner {row['lease_owner']})", now)
+            return len(rows)
+
     def stats(self) -> dict:
         with self._lock:
             rows = self._conn.execute(
@@ -206,3 +257,23 @@ class TaskStore:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+
+class Sweeper(threading.Thread):
+    """Calls store.reclaim_expired() on an interval. Daemon so it dies with the server."""
+
+    def __init__(self, store: TaskStore, interval: float = 1.0):
+        super().__init__(name="sweeper", daemon=True)
+        self.store, self.interval = store, interval
+        self._stop = threading.Event()
+        self.reclaimed_total = 0
+
+    def run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                self.reclaimed_total += self.store.reclaim_expired()
+            except Exception as exc:  # keep sweeping; log and move on
+                print(f"[sweeper] error: {exc!r}")
+
+    def stop(self) -> None:
+        self._stop.set()
