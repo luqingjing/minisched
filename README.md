@@ -13,7 +13,38 @@ Python 3.10+, nothing to install.
 # tests
 pip install -r requirements-dev.txt   # pytest, the only dev dependency
 pytest
+
+# by hand
+python3 -m app --port 8080                 # terminal 1: server
+curl -X POST localhost:8080/tasks -H 'Content-Type: application/json' \
+     -d '{"queue":"default","payload":{"sleep":2}}'
+curl localhost:8080/stats
 ```
+
+## Layout
+
+```
+app/store.py    state machine and every transition (the only place that touches the database)
+app/server.py   HTTP routes: parsing and status-code mapping only
+tests/          store unit tests (fake clock) + HTTP end-to-end
+```
+
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/tasks` | Submit. `{queue, payload, max_attempts?, idempotency_key?, delay_seconds?}`; `Idempotency-Key` header also accepted |
+| GET | `/tasks/{id}` | Get one task |
+| GET | `/tasks?queue=&status=&limit=` | List |
+| POST | `/tasks/{id}/cancel` | Cancel (PENDING only) |
+| POST | `/queues/{queue}/lease` | Worker claims tasks. `{worker_id, max_tasks?, lease_seconds?}`. Returns tasks with a `lease_token` |
+| POST | `/tasks/{id}/heartbeat` | Extend the lease. `{lease_token, lease_seconds?}` |
+| POST | `/tasks/{id}/ack` | Success. `{lease_token, result?}` |
+| POST | `/tasks/{id}/nack` | This attempt failed. `{lease_token, error?, retry_after_seconds?}` |
+| GET | `/stats` | Task counts per queue and status |
+| GET | `/healthz` | Liveness |
+
+Errors: 400 bad input; 404 unknown task; **409 state or token mismatch** (idempotency-key conflict, stale `lease_token`, duplicate ack, cancelling a non-PENDING task).
 
 ## State machine
 
@@ -31,6 +62,5 @@ PENDING ──cancel──▶ CANCELED
 
 ## Next
 
-1. HTTP layer (submit / lease / heartbeat / ack / nack) with end-to-end tests.
-2. An example worker: polling loop, heartbeat thread, ack/nack, crash simulation.
-3. A one-shot demo script.
+1. An example worker: polling loop, heartbeat thread, ack/nack, crash simulation.
+2. A one-shot demo script.
