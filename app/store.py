@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   lease_token      TEXT,
   lease_expires_at REAL,
   next_run_at      REAL NOT NULL,
+  priority         INTEGER NOT NULL DEFAULT 0,
   result           TEXT,
   last_error       TEXT,
   created_at       REAL NOT NULL,
@@ -38,8 +39,19 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_idem
   ON tasks(queue, idempotency_key) WHERE idempotency_key IS NOT NULL;
-CREATE INDEX IF NOT EXISTS ix_tasks_leasable ON tasks(queue, status, next_run_at);
 CREATE INDEX IF NOT EXISTS ix_tasks_expiry   ON tasks(status, lease_expires_at);
+"""
+
+# Additive migrations for databases created by an older version.
+# Each entry: (column, DDL to add it). The leasable index is (re)built after,
+# because its column order must match the lease ORDER BY to be useful.
+MIGRATIONS = [
+    ("priority", "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"),
+]
+LEASABLE_INDEX = """
+DROP INDEX IF EXISTS ix_tasks_leasable;
+CREATE INDEX IF NOT EXISTS ix_tasks_leasable
+  ON tasks(queue, status, priority DESC, next_run_at);
 """
 
 
@@ -76,11 +88,19 @@ class TaskStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._lock = threading.RLock()
         self.backoff = backoff or BackoffPolicy()
         self.now = clock
 
     # helpers
+    def _migrate(self) -> None:
+        have = {r["name"] for r in self._conn.execute("PRAGMA table_info(tasks)")}
+        for column, ddl in MIGRATIONS:
+            if column not in have:
+                self._conn.execute(ddl)
+        self._conn.executescript(LEASABLE_INDEX)
+
     @staticmethod
     def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         d = dict(row)
@@ -96,14 +116,19 @@ class TaskStore:
 
     # producer side
     def submit(self, queue: str, payload: Any, *, max_attempts: int = 3,
-               idempotency_key: Optional[str] = None, delay_seconds: float = 0.0) -> tuple[dict, bool]:
+               idempotency_key: Optional[str] = None, delay_seconds: float = 0.0,
+               priority: int = 0) -> tuple[dict, bool]:
         """
         Returns (task, created). With an idempotency key, resubmitting the same
         request returns the original task and created=False. Same key with a
         different payload is a Conflict, so a bug can't silently overwrite work.
+
+        priority: higher runs first within a queue (default 0). Ties keep FIFO.
         """
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
+        if not -1000 <= int(priority) <= 1000:
+            raise ValueError("priority must be between -1000 and 1000")
         body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         now = self.now()
         with self._lock:
@@ -118,10 +143,10 @@ class TaskStore:
             task_id = str(uuid.uuid4())
             self._conn.execute(
                 """INSERT INTO tasks (id, queue, payload, status, attempts, max_attempts,
-                                      idempotency_key, next_run_at, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)""",
+                                      idempotency_key, next_run_at, priority, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
                 (task_id, queue, body, PENDING, max_attempts, idempotency_key,
-                 now + max(0.0, delay_seconds), now, now))
+                 now + max(0.0, delay_seconds), int(priority), now, now))
             return self._row_to_dict(self._get(task_id)), True
 
     def get(self, task_id: str) -> dict:
@@ -164,7 +189,7 @@ class TaskStore:
                 rows = self._conn.execute(
                     """SELECT id FROM tasks
                        WHERE queue = ? AND status = ? AND next_run_at <= ?
-                       ORDER BY next_run_at, created_at LIMIT ?""",
+                       ORDER BY priority DESC, next_run_at, created_at LIMIT ?""",
                     (queue, PENDING, now, max(1, min(max_tasks, 100)))).fetchall()
                 claimed = []
                 for r in rows:

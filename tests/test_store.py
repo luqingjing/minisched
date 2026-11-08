@@ -1,8 +1,11 @@
 """State-machine tests against the store directly, on a fake clock."""
+import os
+import sqlite3
+import tempfile
 
 import pytest
 
-from app.store import CANCELED, DEAD, LEASED, PENDING, SUCCEEDED, Conflict
+from app.store import CANCELED, DEAD, LEASED, PENDING, SUCCEEDED, Conflict, TaskStore
 
 
 # ---------------------------------------------------------------- idempotency
@@ -42,6 +45,47 @@ def test_lease_is_fifo_by_next_run_at(store, clock):
     clock.advance(1)
     b, _ = store.submit("q", {"b": 1})
     assert [t["id"] for t in store.lease("q", "w", max_tasks=2)] == [a["id"], b["id"]]
+
+
+def test_higher_priority_leases_first_then_fifo(store, clock):
+    low, _ = store.submit("q", {"p": "low"}, priority=0)
+    clock.advance(1)
+    high_a, _ = store.submit("q", {"p": "high-a"}, priority=10)
+    clock.advance(1)
+    high_b, _ = store.submit("q", {"p": "high-b"}, priority=10)
+    got = [t["id"] for t in store.lease("q", "w", max_tasks=3)]
+    assert got == [high_a["id"], high_b["id"], low["id"]]
+
+
+def test_priority_does_not_bypass_next_run_at(store):
+    store.submit("q", {}, priority=100, delay_seconds=10)
+    now_task, _ = store.submit("q", {}, priority=0)
+    assert [t["id"] for t in store.lease("q", "w", max_tasks=2)] == [now_task["id"]]
+
+
+def test_priority_out_of_range_rejected(store):
+    with pytest.raises(ValueError):
+        store.submit("q", {}, priority=5000)
+
+
+def test_migration_adds_priority_to_old_database(clock):
+    path = os.path.join(tempfile.mkdtemp(), "old.db")
+    old = sqlite3.connect(path)
+    old.executescript("""
+        CREATE TABLE tasks (id TEXT PRIMARY KEY, queue TEXT NOT NULL, payload TEXT NOT NULL,
+          status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 3,
+          idempotency_key TEXT, lease_owner TEXT, lease_token TEXT, lease_expires_at REAL,
+          next_run_at REAL NOT NULL, result TEXT, last_error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+        INSERT INTO tasks VALUES ('t1','q','{}','PENDING',0,3,NULL,NULL,NULL,NULL,0,NULL,NULL,0,0);
+    """)
+    old.commit()
+    old.close()
+    s = TaskStore(path, clock=clock)
+    try:
+        assert s.get("t1")["priority"] == 0
+        assert [t["id"] for t in s.lease("q", "w")] == ["t1"]
+    finally:
+        s.close()
 
 
 def test_delayed_task_not_leasable_until_due(store, clock):

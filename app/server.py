@@ -119,7 +119,8 @@ def make_handler(store: TaskStore, quiet: bool = False):
                 queue, payload,
                 max_attempts=int(b.get("max_attempts", 3)),
                 idempotency_key=key,
-                delay_seconds=float(b.get("delay_seconds", 0)))
+                delay_seconds=float(b.get("delay_seconds", 0)),
+                priority=int(b.get("priority", 0)))
             self._send(201 if created else 200, {"task": task, "created": created})
 
         def h_list(self, _p, q):
