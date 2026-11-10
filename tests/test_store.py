@@ -2,6 +2,8 @@
 import os
 import sqlite3
 import tempfile
+import threading
+import time
 
 import pytest
 
@@ -93,6 +95,46 @@ def test_delayed_task_not_leasable_until_due(store, clock):
     assert store.lease("q", "w") == []
     clock.advance(10)
     assert [x["id"] for x in store.lease("q", "w")] == [t["id"]]
+
+
+# ---------------------------------------------------------------- long polling
+def test_long_poll_returns_early_when_task_submitted(store):
+    got = {}
+
+    def waiter():
+        t0 = time.monotonic()
+        got["tasks"] = store.lease("q", "w", wait_seconds=5)
+        got["elapsed"] = time.monotonic() - t0
+
+    th = threading.Thread(target=waiter)
+    th.start()
+    time.sleep(0.2)
+    store.submit("q", {"late": True})
+    th.join(timeout=5)
+    assert len(got["tasks"]) == 1
+    assert got["elapsed"] < 2.0  # woke on notify, not on timeout
+
+
+def test_long_poll_times_out_empty(store):
+    t0 = time.monotonic()
+    assert store.lease("q", "w", wait_seconds=0.3) == []
+    assert time.monotonic() - t0 >= 0.25
+
+
+def test_long_poll_wakes_when_nack_backoff_expires(store, clock):
+    t, _ = store.submit("q", {})
+    leased = store.lease("q", "w1")[0]
+    store.nack(t["id"], leased["lease_token"], "retry me")  # due in 1s of fake time
+    assert store.lease("q", "w2", wait_seconds=0) == []
+
+    def tick():
+        time.sleep(0.2)
+        clock.advance(1)
+        with store._lock:
+            store._runnable.notify_all()
+
+    threading.Thread(target=tick).start()
+    assert [x["id"] for x in store.lease("q", "w2", wait_seconds=3)] == [t["id"]]
 
 
 # ---------------------------------------------------------------- ack / fencing

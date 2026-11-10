@@ -90,6 +90,9 @@ class TaskStore:
         self._conn.executescript(SCHEMA)
         self._migrate()
         self._lock = threading.RLock()
+        # Long polling: waiters block on this condition; any transition
+        # that can make a task runnable (submit, nack, reclaim) notifies it.
+        self._runnable = threading.Condition(self._lock)
         self.backoff = backoff or BackoffPolicy()
         self.now = clock
 
@@ -147,6 +150,7 @@ class TaskStore:
                    VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
                 (task_id, queue, body, PENDING, max_attempts, idempotency_key,
                  now + max(0.0, delay_seconds), int(priority), now, now))
+            self._runnable.notify_all()
             return self._row_to_dict(self._get(task_id)), True
 
     def get(self, task_id: str) -> dict:
@@ -176,36 +180,58 @@ class TaskStore:
 
     # worker side
     def lease(self, queue: str, worker_id: str, *, max_tasks: int = 1,
-              lease_seconds: float = 30.0) -> list[dict]:
+              lease_seconds: float = 30.0, wait_seconds: float = 0.0) -> list[dict]:
         """
         Atomically claim up to max_tasks runnable tasks. Each claim gets a fresh
         lease_token; later heartbeat/ack/nack must present it (fencing), so a
         worker whose lease expired and was handed to someone else is rejected.
+
+        wait_seconds > 0 turns this into a long poll: if nothing is runnable,
+        block until something becomes runnable or the wait runs out. Returns
+        as soon as at least one task is claimed (does not wait to fill max_tasks).
         """
-        now = self.now()
+        deadline = time.monotonic() + max(0.0, min(wait_seconds, 60.0))
         with self._lock:
-            self._conn.execute("BEGIN IMMEDIATE")
-            try:
-                rows = self._conn.execute(
-                    """SELECT id FROM tasks
-                       WHERE queue = ? AND status = ? AND next_run_at <= ?
-                       ORDER BY priority DESC, next_run_at, created_at LIMIT ?""",
-                    (queue, PENDING, now, max(1, min(max_tasks, 100)))).fetchall()
-                claimed = []
-                for r in rows:
-                    token = uuid.uuid4().hex
-                    cur = self._conn.execute(
-                        """UPDATE tasks SET status = ?, attempts = attempts + 1,
-                               lease_owner = ?, lease_token = ?, lease_expires_at = ?, updated_at = ?
-                           WHERE id = ? AND status = ?""",
-                        (LEASED, worker_id, token, now + lease_seconds, now, r["id"], PENDING))
-                    if cur.rowcount == 1:
-                        claimed.append(r["id"])
-                self._conn.execute("COMMIT")
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
-            return [self._row_to_dict(self._get(i)) for i in claimed]
+            while True:
+                claimed = self._try_lease(queue, worker_id, max_tasks, lease_seconds)
+                if claimed:
+                    return claimed
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return []
+                # Wake early when the earliest delayed/backoff task becomes due,
+                # otherwise sleep until notified or the poll deadline.
+                row = self._conn.execute(
+                    "SELECT MIN(next_run_at) AS t FROM tasks WHERE queue = ? AND status = ?",
+                    (queue, PENDING)).fetchone()
+                until_due = (row["t"] - self.now()) if row and row["t"] is not None else remaining
+                self._runnable.wait(timeout=max(0.0, min(remaining, until_due, 1.0)))
+
+    def _try_lease(self, queue: str, worker_id: str, max_tasks: int, lease_seconds: float) -> list[dict]:
+        # one non-blocking claim attempt; caller holds the lock
+        now = self.now()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self._conn.execute(
+                """SELECT id FROM tasks
+                   WHERE queue = ? AND status = ? AND next_run_at <= ?
+                   ORDER BY priority DESC, next_run_at, created_at LIMIT ?""",
+                (queue, PENDING, now, max(1, min(max_tasks, 100)))).fetchall()
+            claimed = []
+            for r in rows:
+                token = uuid.uuid4().hex
+                cur = self._conn.execute(
+                    """UPDATE tasks SET status = ?, attempts = attempts + 1,
+                           lease_owner = ?, lease_token = ?, lease_expires_at = ?, updated_at = ?
+                       WHERE id = ? AND status = ?""",
+                    (LEASED, worker_id, token, now + lease_seconds, now, r["id"], PENDING))
+                if cur.rowcount == 1:
+                    claimed.append(r["id"])
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
+        return [self._row_to_dict(self._get(i)) for i in claimed]
 
     def _fenced_update(self, task_id: str, lease_token: str, set_sql: str, args: tuple) -> dict:
         cur = self._conn.execute(
@@ -253,6 +279,8 @@ class TaskStore:
                    lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
                WHERE id = ?""",
             (status, error[:2000], now + (0 if exhausted else delay), now, row["id"]))
+        if not exhausted:
+            self._runnable.notify_all()
         return self._row_to_dict(self._get(row["id"]))
 
     # background

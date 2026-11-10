@@ -28,20 +28,21 @@ class Client:
     def __init__(self, base: str):
         self.base = base.rstrip("/")
 
-    def _call(self, method: str, path: str, body: dict | None = None):
+    def _call(self, method: str, path: str, body: dict | None = None, timeout: float = 10):
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, method=method,
                                      headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status, json.loads(r.read() or b"{}")
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
-    def lease(self, queue, worker_id, max_tasks, lease_seconds):
+    def lease(self, queue, worker_id, max_tasks, lease_seconds, wait_seconds=0):
         return self._call("POST", f"/queues/{queue}/lease",
                           {"worker_id": worker_id, "max_tasks": max_tasks,
-                           "lease_seconds": lease_seconds})
+                           "lease_seconds": lease_seconds, "wait_seconds": wait_seconds},
+                          timeout=wait_seconds + 10)
 
     def heartbeat(self, task_id, token, lease_seconds):
         return self._call("POST", f"/tasks/{task_id}/heartbeat",
@@ -108,6 +109,8 @@ def main():
     ap.add_argument("--concurrency", type=int, default=2)
     ap.add_argument("--lease-seconds", type=float, default=10.0)
     ap.add_argument("--worker-id", default=f"worker-{os.getpid()}")
+    ap.add_argument("--wait-seconds", type=float, default=5.0,
+                    help="long-poll budget per lease call (0 = plain polling)")
     ap.add_argument("--once", action="store_true", help="exit when the queue is empty")
     args = ap.parse_args()
 
@@ -123,7 +126,11 @@ def main():
     idle_polls = 0
     while True:
         sem.acquire()
-        status, body = client.lease(args.queue, args.worker_id, 1, args.lease_seconds)
+        # Long poll: the server holds the request until a task is runnable or
+        # wait_seconds pass, so an idle worker costs one request per wait window
+        # instead of one every half second, and pickup latency is ~0 not ~poll interval.
+        wait = min(args.wait_seconds, 1.0) if args.once else args.wait_seconds
+        status, body = client.lease(args.queue, args.worker_id, 1, args.lease_seconds, wait)
         tasks = body.get("tasks", []) if status == 200 else []
         if not tasks:
             sem.release()
@@ -131,7 +138,8 @@ def main():
             if args.once and idle_polls > 3:
                 log("queue drained, exiting")
                 return
-            time.sleep(0.5 + random.random() * 0.5)  # jittered poll
+            if wait == 0:
+                time.sleep(0.5 + random.random() * 0.5)  # plain polling fallback
             continue
         idle_polls = 0
 

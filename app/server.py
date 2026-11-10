@@ -9,7 +9,7 @@ Routes
   GET  /tasks?queue=&status=&limit=
   GET  /tasks/{id}
   POST /tasks/{id}/cancel
-  POST /queues/{queue}/lease          {worker_id, max_tasks?, lease_seconds?}
+  POST /queues/{queue}/lease          {worker_id, max_tasks?, lease_seconds?, wait_seconds?}
   POST /tasks/{id}/heartbeat          {lease_token, lease_seconds?}
   POST /tasks/{id}/ack                {lease_token, result?}
   POST /tasks/{id}/nack               {lease_token, error?, retry_after_seconds?}
@@ -140,7 +140,8 @@ def make_handler(store: TaskStore, quiet: bool = False):
             tasks = store.lease(
                 p["queue"], _require(b, "worker_id", str),
                 max_tasks=int(b.get("max_tasks", 1)),
-                lease_seconds=float(b.get("lease_seconds", 30)))
+                lease_seconds=float(b.get("lease_seconds", 30)),
+                wait_seconds=float(b.get("wait_seconds", 0)))
             self._send(200, {"tasks": tasks})
 
         def h_heartbeat(self, p, _q):
