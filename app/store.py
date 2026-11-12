@@ -40,6 +40,20 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_idem
   ON tasks(queue, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_tasks_expiry   ON tasks(status, lease_expires_at);
+
+-- Dependencies: a task is runnable only when every parent SUCCEEDED.
+CREATE TABLE IF NOT EXISTS task_deps (
+  task_id       TEXT NOT NULL REFERENCES tasks(id),
+  depends_on_id TEXT NOT NULL REFERENCES tasks(id),
+  PRIMARY KEY (task_id, depends_on_id)
+);
+CREATE INDEX IF NOT EXISTS ix_deps_parent ON task_deps(depends_on_id);
+"""
+
+# A PENDING task with an unfinished parent is not runnable. Used by lease.
+NO_UNFINISHED_DEPS = """
+NOT EXISTS (SELECT 1 FROM task_deps d JOIN tasks p ON p.id = d.depends_on_id
+            WHERE d.task_id = tasks.id AND p.status != 'SUCCEEDED')
 """
 
 # Additive migrations for databases created by an older version.
@@ -104,11 +118,12 @@ class TaskStore:
                 self._conn.execute(ddl)
         self._conn.executescript(LEASABLE_INDEX)
 
-    @staticmethod
-    def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    def _row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         d = dict(row)
         d["payload"] = json.loads(d["payload"])
         d["result"] = json.loads(d["result"]) if d["result"] else None
+        d["depends_on"] = [r["depends_on_id"] for r in self._conn.execute(
+            "SELECT depends_on_id FROM task_deps WHERE task_id = ? ORDER BY depends_on_id", (d["id"],))]
         return d
 
     def _get(self, task_id: str) -> sqlite3.Row:
@@ -120,21 +135,27 @@ class TaskStore:
     # producer side
     def submit(self, queue: str, payload: Any, *, max_attempts: int = 3,
                idempotency_key: Optional[str] = None, delay_seconds: float = 0.0,
-               priority: int = 0) -> tuple[dict, bool]:
+               priority: int = 0, depends_on: Optional[list[str]] = None) -> tuple[dict, bool]:
         """
         Returns (task, created). With an idempotency key, resubmitting the same
         request returns the original task and created=False. Same key with a
         different payload is a Conflict, so a bug can't silently overwrite work.
 
         priority: higher runs first within a queue (default 0). Ties keep FIFO.
+        depends_on: ids of tasks that must SUCCEED before this one is runnable.
+          If any parent ends DEAD or CANCELED, this task is marked DEAD too.
         """
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         if not -1000 <= int(priority) <= 1000:
             raise ValueError("priority must be between -1000 and 1000")
+        depends_on = sorted(set(depends_on or []))
         body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         now = self.now()
         with self._lock:
+            parents = []
+            for pid in depends_on:
+                parents.append(self._get(pid))  # NotFound if a parent doesn't exist
             if idempotency_key is not None:
                 existing = self._conn.execute(
                     "SELECT * FROM tasks WHERE queue = ? AND idempotency_key = ?",
@@ -150,8 +171,37 @@ class TaskStore:
                    VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)""",
                 (task_id, queue, body, PENDING, max_attempts, idempotency_key,
                  now + max(0.0, delay_seconds), int(priority), now, now))
+            self._conn.executemany(
+                "INSERT INTO task_deps (task_id, depends_on_id) VALUES (?, ?)",
+                [(task_id, pid) for pid in depends_on])
+            # A parent that already failed can never satisfy this task.
+            failed = [p["id"] for p in parents if p["status"] in (DEAD, CANCELED)]
+            if failed:
+                self._conn.execute(
+                    "UPDATE tasks SET status = ?, last_error = ?, updated_at = ? WHERE id = ?",
+                    (DEAD, f"dependency failed: {failed[0]}", now, task_id))
             self._runnable.notify_all()
             return self._row_to_dict(self._get(task_id)), True
+
+    def _fail_dependents(self, parent_id: str, now: float) -> int:
+        """
+        Parent ended DEAD/CANCELED: every PENDING child (transitively) is DEAD.
+        Children that are LEASED can't exist, since they weren't runnable.
+        """
+        total, frontier = 0, [parent_id]
+        while frontier:
+            pid = frontier.pop()
+            kids = [r["task_id"] for r in self._conn.execute(
+                "SELECT task_id FROM task_deps WHERE depends_on_id = ?", (pid,))]
+            for kid in kids:
+                cur = self._conn.execute(
+                    "UPDATE tasks SET status = ?, last_error = ?, updated_at = ? "
+                    "WHERE id = ? AND status = ?",
+                    (DEAD, f"dependency failed: {pid}", now, kid, PENDING))
+                if cur.rowcount:
+                    total += 1
+                    frontier.append(kid)
+        return total
 
     def get(self, task_id: str) -> dict:
         with self._lock:
@@ -176,6 +226,7 @@ class TaskStore:
             if cur.rowcount == 0:
                 row = self._get(task_id)  # raises NotFound if missing
                 raise Conflict(f"cannot cancel a task in status {row['status']}")
+            self._fail_dependents(task_id, self.now())
             return self._row_to_dict(self._get(task_id))
 
     # worker side
@@ -213,8 +264,8 @@ class TaskStore:
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             rows = self._conn.execute(
-                """SELECT id FROM tasks
-                   WHERE queue = ? AND status = ? AND next_run_at <= ?
+                f"""SELECT id FROM tasks
+                   WHERE queue = ? AND status = ? AND next_run_at <= ? AND {NO_UNFINISHED_DEPS}
                    ORDER BY priority DESC, next_run_at, created_at LIMIT ?""",
                 (queue, PENDING, now, max(1, min(max_tasks, 100)))).fetchall()
             claimed = []
@@ -253,11 +304,13 @@ class TaskStore:
     def ack(self, task_id: str, lease_token: str, result: Any = None) -> dict:
         now = self.now()
         with self._lock:
-            return self._fenced_update(
+            done = self._fenced_update(
                 task_id, lease_token,
                 "status = ?, result = ?, lease_owner = NULL, lease_token = NULL, "
                 "lease_expires_at = NULL, updated_at = ?",
                 (SUCCEEDED, json.dumps(result), now))
+            self._runnable.notify_all()  # children may now be runnable
+            return done
 
     def nack(self, task_id: str, lease_token: str, error: str = "",
              retry_after_seconds: Optional[float] = None) -> dict:
@@ -279,7 +332,9 @@ class TaskStore:
                    lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
                WHERE id = ?""",
             (status, error[:2000], now + (0 if exhausted else delay), now, row["id"]))
-        if not exhausted:
+        if exhausted:
+            self._fail_dependents(row["id"], now)
+        else:
             self._runnable.notify_all()
         return self._row_to_dict(self._get(row["id"]))
 

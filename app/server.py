@@ -5,7 +5,8 @@ Routes
 ------
   GET  /healthz
   GET  /stats
-  POST /tasks                         {queue, payload, max_attempts?, idempotency_key?, delay_seconds?}
+  POST /tasks                         {queue, payload, max_attempts?, idempotency_key?, delay_seconds?,
+                                       priority?, depends_on?: [task_id]}
   GET  /tasks?queue=&status=&limit=
   GET  /tasks/{id}
   POST /tasks/{id}/cancel
@@ -51,6 +52,15 @@ def _require(body: dict, key: str, typ=None):
     if typ is not None and not isinstance(body[key], typ):
         raise BadRequest(f"field '{key}' must be {typ.__name__}")
     return body[key]
+
+
+def _optional_list(body: dict, key: str) -> list[str] | None:
+    v = body.get(key)
+    if v is None:
+        return None
+    if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+        raise BadRequest(f"field '{key}' must be a list of task ids")
+    return v
 
 
 def make_handler(store: TaskStore, quiet: bool = False):
@@ -120,7 +130,8 @@ def make_handler(store: TaskStore, quiet: bool = False):
                 max_attempts=int(b.get("max_attempts", 3)),
                 idempotency_key=key,
                 delay_seconds=float(b.get("delay_seconds", 0)),
-                priority=int(b.get("priority", 0)))
+                priority=int(b.get("priority", 0)),
+                depends_on=_optional_list(b, "depends_on"))
             self._send(201 if created else 200, {"task": task, "created": created})
 
         def h_list(self, _p, q):

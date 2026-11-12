@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from app.store import CANCELED, DEAD, LEASED, PENDING, SUCCEEDED, Conflict, TaskStore
+from app.store import CANCELED, DEAD, LEASED, PENDING, SUCCEEDED, Conflict, NotFound, TaskStore
 
 
 # ---------------------------------------------------------------- idempotency
@@ -211,6 +211,61 @@ def test_expired_lease_counts_as_an_attempt(store, clock):
     got = store.get(t["id"])
     assert (got["status"], got["attempts"]) == (DEAD, 2)
     assert "lease expired" in got["last_error"]
+
+
+# ---------------------------------------------------------------- dependencies
+def test_child_not_runnable_until_parent_succeeds(store):
+    parent, _ = store.submit("q", {"p": 1})
+    child, _ = store.submit("q", {"c": 1}, depends_on=[parent["id"]])
+    assert child["depends_on"] == [parent["id"]]
+    got = store.lease("q", "w", max_tasks=5)
+    assert [t["id"] for t in got] == [parent["id"]]  # child skipped
+    assert store.lease("q", "w", max_tasks=5) == []
+    store.ack(parent["id"], got[0]["lease_token"])
+    assert [t["id"] for t in store.lease("q", "w")] == [child["id"]]
+
+
+def test_dead_parent_kills_children_transitively(store):
+    a, _ = store.submit("q", {}, max_attempts=1)
+    b, _ = store.submit("q", {}, depends_on=[a["id"]])
+    c, _ = store.submit("q", {}, depends_on=[b["id"]])
+    leased = store.lease("q", "w")[0]
+    store.nack(a["id"], leased["lease_token"], "boom")  # a -> DEAD
+    assert store.get(b["id"])["status"] == DEAD
+    assert store.get(c["id"])["status"] == DEAD
+    assert "dependency failed" in store.get(c["id"])["last_error"]
+
+
+def test_canceled_parent_kills_children(store):
+    a, _ = store.submit("q", {})
+    b, _ = store.submit("q", {}, depends_on=[a["id"]])
+    store.cancel(a["id"])
+    assert store.get(b["id"])["status"] == DEAD
+
+
+def test_depending_on_already_failed_parent_is_dead_at_submit(store):
+    a, _ = store.submit("q", {})
+    store.cancel(a["id"])
+    b, _ = store.submit("q", {}, depends_on=[a["id"]])
+    assert b["status"] == DEAD
+
+
+def test_depending_on_missing_parent_is_not_found(store):
+    with pytest.raises(NotFound):
+        store.submit("q", {}, depends_on=["nope"])
+
+
+def test_parent_ack_wakes_long_poller_waiting_on_child(store):
+    parent, _ = store.submit("q", {})
+    child, _ = store.submit("q", {}, depends_on=[parent["id"]])
+    leased = store.lease("q", "w1")[0]  # takes the parent
+    out = {}
+    th = threading.Thread(target=lambda: out.setdefault("got", store.lease("q", "w2", wait_seconds=5)))
+    th.start()
+    time.sleep(0.2)
+    store.ack(parent["id"], leased["lease_token"])
+    th.join(5)
+    assert [t["id"] for t in out["got"]] == [child["id"]]
 
 
 # ---------------------------------------------------------------- cancel / observability / stats
