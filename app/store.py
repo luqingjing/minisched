@@ -6,7 +6,9 @@ consumers must be idempotent.
 """
 from __future__ import annotations
 
+import collections
 import json
+import logging
 import random
 import sqlite3
 import threading
@@ -14,6 +16,8 @@ import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
+
+log = logging.getLogger("minisched")
 
 PENDING, LEASED, SUCCEEDED, DEAD, CANCELED = "PENDING", "LEASED", "SUCCEEDED", "DEAD", "CANCELED"
 STATUSES = (PENDING, LEASED, SUCCEEDED, DEAD, CANCELED)
@@ -107,8 +111,18 @@ class TaskStore:
         # Long polling: waiters block on this condition; any transition
         # that can make a task runnable (submit, nack, reclaim) notifies it.
         self._runnable = threading.Condition(self._lock)
+        # Observability: every transition emits one structured event
+        # (JSON log line) and bumps a counter; /metrics renders the counters.
+        self.counters: dict[str, int] = collections.Counter()
+        self.pickup_latency = {"sum": 0.0, "count": 0}   # seconds from runnable to leased
         self.backoff = backoff or BackoffPolicy()
         self.now = clock
+
+    def _emit(self, event: str, task_id: str, **fields: Any) -> None:
+        self.counters[event] += 1
+        if log.isEnabledFor(logging.INFO):
+            rec = {"ts": round(self.now(), 3), "event": event, "task": task_id, **fields}
+            log.info(json.dumps(rec, default=str))
 
     # helpers
     def _migrate(self) -> None:
@@ -163,6 +177,7 @@ class TaskStore:
                 if existing is not None:
                     if existing["payload"] != body:
                         raise Conflict("idempotency_key reused with a different payload")
+                    self._emit("replayed", existing["id"], queue=queue, key=idempotency_key)
                     return self._row_to_dict(existing), False
             task_id = str(uuid.uuid4())
             self._conn.execute(
@@ -180,6 +195,9 @@ class TaskStore:
                 self._conn.execute(
                     "UPDATE tasks SET status = ?, last_error = ?, updated_at = ? WHERE id = ?",
                     (DEAD, f"dependency failed: {failed[0]}", now, task_id))
+                self._emit("dead", task_id, queue=queue, reason="dependency_failed", parent=failed[0])
+            self._emit("submitted", task_id, queue=queue, priority=int(priority),
+                       depends_on=len(depends_on), delay=max(0.0, delay_seconds))
             self._runnable.notify_all()
             return self._row_to_dict(self._get(task_id)), True
 
@@ -199,6 +217,7 @@ class TaskStore:
                     "WHERE id = ? AND status = ?",
                     (DEAD, f"dependency failed: {pid}", now, kid, PENDING))
                 if cur.rowcount:
+                    self._emit("dead", kid, reason="dependency_failed", parent=pid)
                     total += 1
                     frontier.append(kid)
         return total
@@ -226,6 +245,7 @@ class TaskStore:
             if cur.rowcount == 0:
                 row = self._get(task_id)  # raises NotFound if missing
                 raise Conflict(f"cannot cancel a task in status {row['status']}")
+            self._emit("canceled", task_id)
             self._fail_dependents(task_id, self.now())
             return self._row_to_dict(self._get(task_id))
 
@@ -264,7 +284,7 @@ class TaskStore:
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             rows = self._conn.execute(
-                f"""SELECT id FROM tasks
+                f"""SELECT id, next_run_at, attempts FROM tasks
                    WHERE queue = ? AND status = ? AND next_run_at <= ? AND {NO_UNFINISHED_DEPS}
                    ORDER BY priority DESC, next_run_at, created_at LIMIT ?""",
                 (queue, PENDING, now, max(1, min(max_tasks, 100)))).fetchall()
@@ -278,6 +298,11 @@ class TaskStore:
                     (LEASED, worker_id, token, now + lease_seconds, now, r["id"], PENDING))
                 if cur.rowcount == 1:
                     claimed.append(r["id"])
+                    waited = max(0.0, now - r["next_run_at"])
+                    self.pickup_latency["sum"] += waited
+                    self.pickup_latency["count"] += 1
+                    self._emit("leased", r["id"], queue=queue, worker=worker_id,
+                               attempt=r["attempts"] + 1, waited=round(waited, 3))
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
@@ -290,6 +315,7 @@ class TaskStore:
             (*args, task_id, LEASED, lease_token))
         if cur.rowcount == 0:
             row = self._get(task_id)
+            self._emit("fenced", task_id, status=row["status"], owner=row["lease_owner"])
             raise Conflict(f"lease token rejected (task is {row['status']}, "
                            f"owned by {row['lease_owner']})")
         return self._row_to_dict(self._get(task_id))
@@ -309,6 +335,7 @@ class TaskStore:
                 "status = ?, result = ?, lease_owner = NULL, lease_token = NULL, "
                 "lease_expires_at = NULL, updated_at = ?",
                 (SUCCEEDED, json.dumps(result), now))
+            self._emit("acked", task_id, attempt=done["attempts"], worker=done.get("lease_owner"))
             self._runnable.notify_all()  # children may now be runnable
             return done
 
@@ -319,6 +346,7 @@ class TaskStore:
         with self._lock:
             row = self._get(task_id)
             if row["status"] != LEASED or row["lease_token"] != lease_token:
+                self._emit("fenced", task_id, status=row["status"], owner=row["lease_owner"])
                 raise Conflict("lease token rejected")
             return self._release(row, error or "nack", now, retry_after_seconds)
 
@@ -332,6 +360,10 @@ class TaskStore:
                    lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?
                WHERE id = ?""",
             (status, error[:2000], now + (0 if exhausted else delay), now, row["id"]))
+        self._emit("dead" if exhausted else "retry_scheduled", row["id"],
+                   attempt=row["attempts"], max_attempts=row["max_attempts"],
+                   worker=row["lease_owner"], error=error[:200],
+                   **({} if exhausted else {"delay": round(delay, 3)}))
         if exhausted:
             self._fail_dependents(row["id"], now)
         else:
@@ -350,6 +382,8 @@ class TaskStore:
                 "SELECT * FROM tasks WHERE status = ? AND lease_expires_at < ?",
                 (LEASED, now)).fetchall()
             for row in rows:
+                self._emit("lease_expired", row["id"], worker=row["lease_owner"],
+                           attempt=row["attempts"])
                 self._release(row, f"lease expired (owner {row['lease_owner']})", now)
             return len(rows)
 
@@ -361,6 +395,25 @@ class TaskStore:
         for r in rows:
             out.setdefault(r["queue"], {s: 0 for s in STATUSES})[r["status"]] = r["n"]
         return out
+
+    def metrics_text(self) -> str:
+        """Prometheus exposition format. Scrape GET /metrics."""
+        lines = ["# HELP minisched_tasks Tasks by queue and status.",
+                 "# TYPE minisched_tasks gauge"]
+        for queue, by_status in sorted(self.stats().items()):
+            for status, n in by_status.items():
+                lines.append(f'minisched_tasks{{queue="{queue}",status="{status}"}} {n}')
+        lines += ["# HELP minisched_events_total State transitions since process start.",
+                  "# TYPE minisched_events_total counter"]
+        with self._lock:
+            for event, n in sorted(self.counters.items()):
+                lines.append(f'minisched_events_total{{event="{event}"}} {n}')
+            lat = dict(self.pickup_latency)
+        lines += ["# HELP minisched_pickup_latency_seconds Seconds a task waited runnable before a worker leased it.",
+                  "# TYPE minisched_pickup_latency_seconds summary",
+                  f"minisched_pickup_latency_seconds_sum {lat['sum']:.6f}",
+                  f"minisched_pickup_latency_seconds_count {lat['count']}"]
+        return "\n".join(lines) + "\n"
 
     def close(self) -> None:
         with self._lock:

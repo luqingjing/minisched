@@ -1,4 +1,5 @@
 """State-machine tests against the store directly, on a fake clock."""
+import logging
 import os
 import sqlite3
 import tempfile
@@ -277,6 +278,21 @@ def test_cancel_only_pending(store):
     store.lease("q", "w")
     with pytest.raises(Conflict):
         store.cancel(t2["id"])
+
+
+def test_events_are_counted_and_logged_as_json(store, caplog):
+    import json
+
+    with caplog.at_level(logging.INFO, logger="minisched"):
+        t, _ = store.submit("q", {}, idempotency_key="k")
+        store.submit("q", {}, idempotency_key="k")
+        leased = store.lease("q", "w")[0]
+        store.nack(t["id"], leased["lease_token"], "x")
+    c = store.counters
+    assert (c["submitted"], c["replayed"], c["leased"], c["retry_scheduled"]) == (1, 1, 1, 1)
+    events = [json.loads(r.getMessage())["event"] for r in caplog.records if r.name == "minisched"]
+    assert events == ["submitted", "replayed", "leased", "retry_scheduled"]
+    assert store.pickup_latency["count"] == 1
 
 
 def test_stats(store):

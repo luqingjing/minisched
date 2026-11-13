@@ -1,5 +1,6 @@
 """End-to-end over real HTTP against a scheduler on a random port."""
 import time
+import urllib.request
 
 from conftest import call
 
@@ -57,6 +58,18 @@ def test_sweeper_reclaims_crashed_worker(server):
     assert got["task"]["status"] == "PENDING"
     assert "lease expired" in got["task"]["last_error"]
     assert got["task"]["lease_owner"] is None
+
+
+def test_metrics_endpoint(server):
+    _, c = call(server, "POST", "/tasks", {"queue": "met", "payload": {}})
+    _, l = call(server, "POST", "/queues/met/lease", {"worker_id": "m"})
+    call(server, "POST", f"/tasks/{c['task']['id']}/ack", {"lease_token": l["tasks"][0]["lease_token"]})
+    with urllib.request.urlopen(server + "/metrics", timeout=5) as r:
+        assert "text/plain" in r.headers["Content-Type"]
+        text = r.read().decode()
+    assert 'minisched_tasks{queue="met",status="SUCCEEDED"} 1' in text
+    assert 'minisched_events_total{event="acked"} 1' in text
+    assert "minisched_pickup_latency_seconds_count 1" in text
 
 
 def test_unknown_task_and_route(server):

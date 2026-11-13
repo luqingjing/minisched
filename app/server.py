@@ -30,7 +30,9 @@ from .store import Conflict, NotFound, Sweeper, TaskStore
 
 ROUTES = [
     ("GET",  re.compile(r"^/healthz$"),                     "healthz"),
+    # GET /metrics is Prometheus text; everything else is JSON.
     ("GET",  re.compile(r"^/stats$"),                       "stats"),
+    ("GET",  re.compile(r"^/metrics$"),                     "metrics"),
     ("POST", re.compile(r"^/tasks$"),                       "submit"),
     ("GET",  re.compile(r"^/tasks$"),                       "list"),
     ("GET",  re.compile(r"^/tasks/(?P<id>[^/]+)$"),         "get"),
@@ -120,6 +122,14 @@ def make_handler(store: TaskStore, quiet: bool = False):
         def h_stats(self, _p, _q):
             self._send(200, {"queues": store.stats()})
 
+        def h_metrics(self, _p, _q):
+            data = store.metrics_text().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def h_submit(self, _p, _q):
             b = self._body()
             queue = _require(b, "queue", str)
@@ -195,7 +205,11 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--db", default="minisched.db")
     ap.add_argument("--sweep-interval", type=float, default=1.0)
+    ap.add_argument("--log-level", default="INFO", help="INFO logs one JSON line per state transition")
     args = ap.parse_args(argv)
+    import logging
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO),
+                        format="%(message)s", stream=sys.stderr)
     httpd = serve(args.host, args.port, args.db, args.sweep_interval)
     print(f"minisched listening on http://{args.host}:{args.port}  (db: {args.db})")
     try:
