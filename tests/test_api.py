@@ -72,6 +72,19 @@ def test_metrics_endpoint(server):
     assert "minisched_pickup_latency_seconds_count 1" in text
 
 
+def test_dlq_retry_over_http(server):
+    _, c = call(server, "POST", "/tasks", {"queue": "dlq", "payload": {}, "max_attempts": 1})
+    tid = c["task"]["id"]
+    _, l = call(server, "POST", "/queues/dlq/lease", {"worker_id": "w"})
+    call(server, "POST", f"/tasks/{tid}/nack", {"lease_token": l["tasks"][0]["lease_token"], "error": "x"})
+    s, r = call(server, "POST", f"/tasks/{tid}/retry", {"max_attempts": 2})
+    assert (s, r["task"]["status"], r["task"]["max_attempts"]) == (200, "PENDING", 2)
+    s, _ = call(server, "POST", f"/tasks/{tid}/retry")
+    assert s == 409
+    s, b = call(server, "POST", "/queues/dlq/retry-dead", {})
+    assert (s, b["count"]) == (200, 0)
+
+
 def test_unknown_task_and_route(server):
     assert call(server, "GET", "/tasks/nope")[0] == 404
     assert call(server, "GET", "/nothing")[0] == 404

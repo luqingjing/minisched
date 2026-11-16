@@ -249,6 +249,42 @@ class TaskStore:
             self._fail_dependents(task_id, self.now())
             return self._row_to_dict(self._get(task_id))
 
+    # DLQ
+    def retry_dead(self, task_id: str, *, max_attempts: Optional[int] = None) -> dict:
+        """
+        Operator action: put a DEAD task back in line. Attempts reset to 0 so the
+        task gets a full budget again; last_error is kept so the history is
+        visible. Optionally raise max_attempts at the same time.
+        Dependents that were killed by this task's failure are NOT revived
+        automatically; they need their own retry. Keeping that explicit avoids
+        surprising fan-out from one click.
+        """
+        now = self.now()
+        with self._lock:
+            row = self._get(task_id)
+            if row["status"] != DEAD:
+                raise Conflict(f"only DEAD tasks can be retried (task is {row['status']})")
+            new_max = int(max_attempts) if max_attempts is not None else row["max_attempts"]
+            if new_max < 1:
+                raise ValueError("max_attempts must be >= 1")
+            self._conn.execute(
+                """UPDATE tasks SET status = ?, attempts = 0, max_attempts = ?, next_run_at = ?,
+                       updated_at = ? WHERE id = ?""",
+                (PENDING, new_max, now, now, task_id))
+            self._emit("retried", task_id, previous_error=(row["last_error"] or "")[:200])
+            self._runnable.notify_all()
+            return self._row_to_dict(self._get(task_id))
+
+    def retry_dead_in_queue(self, queue: str, *, limit: int = 100) -> list[str]:
+        """Bulk form of retry_dead: oldest DEAD tasks first. Returns the ids revived."""
+        with self._lock:
+            ids = [r["id"] for r in self._conn.execute(
+                "SELECT id FROM tasks WHERE queue = ? AND status = ? ORDER BY updated_at LIMIT ?",
+                (queue, DEAD, max(1, min(limit, 1000))))]
+            for tid in ids:
+                self.retry_dead(tid)
+            return ids
+
     # worker side
     def lease(self, queue: str, worker_id: str, *, max_tasks: int = 1,
               lease_seconds: float = 30.0, wait_seconds: float = 0.0) -> list[dict]:

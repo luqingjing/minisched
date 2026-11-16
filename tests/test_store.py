@@ -11,6 +11,15 @@ import pytest
 from app.store import CANCELED, DEAD, LEASED, PENDING, SUCCEEDED, Conflict, NotFound, TaskStore
 
 
+# ---------------------------------------------------------------- DLQ
+def _kill(store, max_attempts=1):
+    t, _ = store.submit("q", {}, max_attempts=max_attempts)
+    leased = store.lease("q", "w")[0]
+    store.nack(t["id"], leased["lease_token"], "fatal")
+    assert store.get(t["id"])["status"] == DEAD
+    return t["id"]
+
+
 # ---------------------------------------------------------------- idempotency
 def test_idempotent_submit_returns_same_task(store):
     a, created_a = store.submit("q", {"n": 1}, idempotency_key="k1")
@@ -267,6 +276,38 @@ def test_parent_ack_wakes_long_poller_waiting_on_child(store):
     store.ack(parent["id"], leased["lease_token"])
     th.join(5)
     assert [t["id"] for t in out["got"]] == [child["id"]]
+
+
+def test_retry_dead_resets_attempts_and_keeps_error(store):
+    tid = _kill(store)
+    r = store.retry_dead(tid, max_attempts=3)
+    assert (r["status"], r["attempts"], r["max_attempts"], r["last_error"]) == (PENDING, 0, 3, "fatal")
+    assert [x["id"] for x in store.lease("q", "w")] == [tid]
+
+
+def test_retry_only_applies_to_dead(store):
+    t, _ = store.submit("q", {})
+    with pytest.raises(Conflict):
+        store.retry_dead(t["id"])
+
+
+def test_bulk_retry_oldest_first_with_limit(store, clock):
+    a = _kill(store)
+    clock.advance(1)
+    b = _kill(store)
+    clock.advance(1)
+    c = _kill(store)
+    assert store.retry_dead_in_queue("q", limit=2) == [a, b]
+    assert store.get(c)["status"] == DEAD
+
+
+def test_retry_does_not_revive_dependents(store):
+    a, _ = store.submit("q", {}, max_attempts=1)
+    b, _ = store.submit("q", {}, depends_on=[a["id"]])
+    leased = store.lease("q", "w")[0]
+    store.nack(a["id"], leased["lease_token"], "boom")
+    store.retry_dead(a["id"])
+    assert store.get(b["id"])["status"] == DEAD  # needs its own retry
 
 
 # ---------------------------------------------------------------- cancel / observability / stats

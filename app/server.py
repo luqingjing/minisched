@@ -10,6 +10,8 @@ Routes
   GET  /tasks?queue=&status=&limit=
   GET  /tasks/{id}
   POST /tasks/{id}/cancel
+  POST /tasks/{id}/retry              {max_attempts?}        DEAD -> PENDING, attempts reset
+  POST /queues/{queue}/retry-dead     {limit?}               bulk form, oldest first
   POST /queues/{queue}/lease          {worker_id, max_tasks?, lease_seconds?, wait_seconds?}
   POST /tasks/{id}/heartbeat          {lease_token, lease_seconds?}
   POST /tasks/{id}/ack                {lease_token, result?}
@@ -37,6 +39,8 @@ ROUTES = [
     ("GET",  re.compile(r"^/tasks$"),                       "list"),
     ("GET",  re.compile(r"^/tasks/(?P<id>[^/]+)$"),         "get"),
     ("POST", re.compile(r"^/tasks/(?P<id>[^/]+)/cancel$"),  "cancel"),
+    ("POST", re.compile(r"^/tasks/(?P<id>[^/]+)/retry$"),   "retry"),
+    ("POST", re.compile(r"^/queues/(?P<queue>[^/]+)/retry-dead$"), "retry_dead"),
     ("POST", re.compile(r"^/queues/(?P<queue>[^/]+)/lease$"), "lease"),
     ("POST", re.compile(r"^/tasks/(?P<id>[^/]+)/heartbeat$"), "heartbeat"),
     ("POST", re.compile(r"^/tasks/(?P<id>[^/]+)/ack$"),     "ack"),
@@ -155,6 +159,17 @@ def make_handler(store: TaskStore, quiet: bool = False):
 
         def h_cancel(self, p, _q):
             self._send(200, {"task": store.cancel(p["id"])})
+
+        def h_retry(self, p, _q):
+            b = self._body()
+            m = b.get("max_attempts")
+            self._send(200, {"task": store.retry_dead(
+                p["id"], max_attempts=int(m) if m is not None else None)})
+
+        def h_retry_dead(self, p, _q):
+            b = self._body()
+            ids = store.retry_dead_in_queue(p["queue"], limit=int(b.get("limit", 100)))
+            self._send(200, {"retried": ids, "count": len(ids)})
 
         def h_lease(self, p, _q):
             b = self._body()
