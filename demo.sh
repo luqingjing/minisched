@@ -18,7 +18,8 @@ post '{"queue":"default","payload":{"fail":true},"max_attempts":2}'
 post '{"queue":"default","payload":{"crash":true},"max_attempts":3}'
 post '{"queue":"default","payload":{"sleep":0.1},"idempotency_key":"order-42"}'
 post '{"queue":"default","payload":{"sleep":0.1},"idempotency_key":"order-42"}'   # replay: no new task
-echo "submitted 5 tasks (6 requests, one idempotent replay)"
+post '{"queue":"default","payload":{"sleep":0.1,"note":"urgent"},"priority":10}'   # jumps the line
+echo "submitted 6 tasks (7 requests, one idempotent replay)"
 
 python3 worker.py --server "http://localhost:$PORT" --worker-id A --lease-seconds 2 --once &
 python3 worker.py --server "http://localhost:$PORT" --worker-id B --lease-seconds 2 --once &
@@ -29,6 +30,7 @@ echo; echo "--- /stats"; curl -s "localhost:$PORT/stats"; echo
 echo "--- DEAD tasks"
 curl -s "localhost:$PORT/tasks?status=DEAD" | python3 -c \
   "import sys,json;[print(t['id'][:8],'attempts=%d'%t['attempts'],t['last_error']) for t in json.load(sys.stdin)['tasks']]"
+echo "--- /metrics (counters only)"; curl -s "localhost:$PORT/metrics" | grep events_total | grep -v '^#'
 echo "--- still PENDING (the crashed one, waiting out its backoff)"
 curl -s "localhost:$PORT/tasks?status=PENDING" | python3 -c \
   "import sys,json;[print(t['id'][:8],'attempts=%d'%t['attempts'],t['last_error']) for t in json.load(sys.stdin)['tasks']]"
