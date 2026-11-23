@@ -37,8 +37,8 @@ def store(clock):
     s.close()
 
 
-def _serve(sweep_interval=0.2):
-    httpd = serve("127.0.0.1", 0, ":memory:", sweep_interval=sweep_interval, quiet=True)
+def _serve(backoff=None, sweep_interval=0.2):
+    httpd = serve("127.0.0.1", 0, ":memory:", sweep_interval=sweep_interval, quiet=True, backoff=backoff)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 
@@ -53,6 +53,14 @@ def _shutdown(httpd):
 def server():
     """Base URL of a real scheduler on a random port, torn down after the test."""
     httpd = _serve()
+    yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    _shutdown(httpd)
+
+
+@pytest.fixture
+def fast_server():
+    """Same, with short backoff so retry paths run in well under a second."""
+    httpd = _serve(backoff=BackoffPolicy(base_seconds=0.1, max_seconds=0.5, jitter=0.0), sweep_interval=0.1)
     yield f"http://127.0.0.1:{httpd.server_address[1]}"
     _shutdown(httpd)
 

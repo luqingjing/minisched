@@ -203,8 +203,8 @@ def make_handler(store: TaskStore, quiet: bool = False):
 
 
 def serve(host: str = "127.0.0.1", port: int = 8080, db: str = "minisched.db",
-          sweep_interval: float = 1.0, quiet: bool = False) -> ThreadingHTTPServer:
-    store = TaskStore(db)
+          sweep_interval: float = 1.0, quiet: bool = False, backoff=None) -> ThreadingHTTPServer:
+    store = TaskStore(db, backoff=backoff)
     sweeper = Sweeper(store, sweep_interval)
     sweeper.start()
     httpd = ThreadingHTTPServer((host, port), make_handler(store, quiet))
