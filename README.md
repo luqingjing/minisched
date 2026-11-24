@@ -12,7 +12,7 @@ The history is incremental. The first five commits build the scheduler from the 
 Python 3.10+, nothing to install.
 
 ```bash
-# tests (41, about 3 seconds, chaos test included)
+# tests (56, about 20 seconds, chaos and llmbatch tests included)
 pip install -r requirements-dev.txt   # pytest, the only dev dependency
 pytest
 
@@ -34,8 +34,10 @@ curl localhost:8080/stats
 app/store.py    state machine and every transition (the only place that touches the database)
 app/server.py   HTTP routes: parsing and status-code mapping only
 worker.py       example worker: long polling, heartbeat, ack/nack, crash simulation
-tests/          store unit tests (fake clock) + HTTP end-to-end + chaos test
+tests/          store unit tests (fake clock) + HTTP end-to-end + chaos test + llmbatch
+llmbatch/       LLM batch-processing layer on top of the scheduler (see LLMBATCH.md)
 demo.sh         one-shot demo
+demo_llm.sh     llmbatch demo against a fake provider
 ```
 
 ## API
@@ -105,6 +107,24 @@ Unique index on `(queue, idempotency_key)`. Same key and same payload returns th
 | Priority | low priority starves | Done. Next: aging so effective priority rises with wait time |
 | Observability | nothing visible when it breaks | Done: structured events + `/metrics`. Next: histogram instead of summary for p99; alert on the `fenced` rate |
 | DEAD tasks sit there | no DLQ workflow | Done: single and bulk replay. Next: alert on the DEAD rate |
+
+## llmbatch
+
+An LLM batch-processing layer that runs on the scheduler, in `llmbatch/`.
+It maps the usual LLM-integration problems onto the scheduler's primitives:
+429s become nacks with the provider's retry-after, 5xx get exponential
+backoff, 4xx drain to DEAD without waiting, structured outputs are validated
+against a JSON schema before ack, and the prompt hash is the idempotency key,
+so a repeated request is served from the finished task instead of billed
+again. Each provider gets its own concurrency limit; every result carries
+tokens, cost and latency, exposed on `/metrics`. Embedding tasks feed a small
+cosine index for nearest-neighbour search. Offline-testable with a scriptable
+fake provider. Details in [LLMBATCH.md](LLMBATCH.md).
+
+```bash
+pytest tests/test_llmbatch.py
+./demo_llm.sh
+```
 
 ## Further work
 
